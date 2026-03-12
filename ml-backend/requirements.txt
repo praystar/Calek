@@ -1,0 +1,42 @@
+# Core
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.1
+python-multipart>=0.0.9
+
+# ML & Vision  (unpinned — pip picks latest compatible)
+torch>=2.9.0
+torchvision>=0.20.0
+numpy>=1.26.4
+Pillow>=10.2.0
+opencv-python-headless>=4.9.0.80
+scikit-image>=0.22.0
+
+# Character extraction & OCR
+pytesseract>=0.3.10
+easyocr>=1.7.1
+
+# Handwriting model
+transformers>=4.38.2
+accelerate>=0.27.2
+
+# Style analysis
+scikit-learn>=1.4.1
+scipy>=1.12.0
+
+# Audio / ASR (Whisper)
+openai-whisper>=20231117
+ffmpeg-python>=0.2.0
+soundfile>=0.12.1
+
+# Font utilities
+fonttools>=4.49.0
+
+# Utilities
+python-dotenv>=1.0.1
+pydantic>=2.6.3
+httpx>=0.27.0
+tqdm>=4.66.2
+
+# Export
+matplotlib>=3.8.3
+reportlab>=4.1.0
