@@ -1,114 +1,143 @@
-"""Corpus API routes — upload, analyze, and synthesize handwriting."""
+"""
+Corpus routes
+Upload 1–3 photos of your handwriting → extract real character glyphs →
+save to disk → use those actual images when rendering text.
+"""
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
-import tempfile, os, shutil, logging
+import tempfile, os, shutil, logging, json
 from pathlib import Path
+import numpy as np
+import cv2
+from PIL import Image
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Lazy-load heavy ML modules
-_extractor = None
-_style_analyzer = None
-_font_synth = None
-_model = None
-_glyph_library = {}
+GLYPH_DIR = Path("data/user_glyphs")
+GLYPH_DIR.mkdir(parents=True, exist_ok=True)
+STYLE_FILE = Path("data/user_glyphs/style.json")
+
+_style_metrics: dict = {}
 
 
-def get_extractor():
-    global _extractor
-    if _extractor is None:
-        from utils.character_extractor import CharacterExtractor
-        _extractor = CharacterExtractor()
-    return _extractor
+def _load_style_analyzer():
+    from utils.style_analyzer import StyleAnalyzer
+    return StyleAnalyzer()
+
+def _load_extractor():
+    from utils.character_extractor import CharacterExtractor
+    return CharacterExtractor()
+
+def _load_font_synth():
+    from utils.font_synthesizer import FontSynthesizer
+    return FontSynthesizer()
 
 
-def get_style_analyzer():
-    global _style_analyzer
-    if _style_analyzer is None:
-        from utils.style_analyzer import StyleAnalyzer
-        _style_analyzer = StyleAnalyzer()
-    return _style_analyzer
+def _save_glyph_image(char: str, img_array: np.ndarray, index: int) -> Path:
+    safe = ord(char)
+    path = GLYPH_DIR / f"{safe}_{index}.png"
+    pil = Image.fromarray((img_array * 255).astype(np.uint8))
+    pil.save(path)
+    return path
 
 
-def get_font_synth():
-    global _font_synth
-    if _font_synth is None:
-        from utils.font_synthesizer import FontSynthesizer
-        _font_synth = FontSynthesizer()
-    return _font_synth
-
-
-def get_model():
-    global _model
-    if _model is None:
-        from models.handwriting_model import HandwritingSynthesizer
-        _model = HandwritingSynthesizer()
-    return _model
+def _list_saved_chars() -> List[str]:
+    chars = set()
+    for f in GLYPH_DIR.glob("*.png"):
+        try:
+            codepoint = int(f.stem.split("_")[0])
+            chars.add(chr(codepoint))
+        except Exception:
+            pass
+    return sorted(chars)
 
 
 @router.post("/analyze")
 async def analyze_corpus(images: List[UploadFile] = File(...)):
     """
-    Analyze uploaded handwriting images:
-    - Extract individual glyphs
-    - Compute style metrics
-    - Report character coverage
+    Upload 1-3 handwriting photos.
+    Extracts every legible character as a real glyph PNG saved to disk.
     """
-    global _glyph_library
+    global _style_metrics
     tmpdir = tempfile.mkdtemp()
 
     try:
         saved_paths = []
         for img in images:
             if not img.content_type.startswith("image/"):
-                raise HTTPException(400, f"File {img.filename} is not an image")
+                raise HTTPException(400, f"{img.filename} is not an image")
             dest = os.path.join(tmpdir, img.filename or "image.png")
             with open(dest, "wb") as f:
                 shutil.copyfileobj(img.file, f)
             saved_paths.append(dest)
 
-        # Extract glyphs
-        extractor = get_extractor()
+        extractor = _load_extractor()
         all_glyphs = []
         for path in saved_paths:
             try:
                 glyphs = extractor.extract_from_image(path)
                 all_glyphs.extend(glyphs)
+                logger.info(f"Extracted {len(glyphs)} glyphs from {path}")
             except Exception as e:
-                logger.warning(f"Failed to extract from {path}: {e}")
+                logger.warning(f"Extraction failed for {path}: {e}")
 
-        _glyph_library = extractor.build_glyph_library(all_glyphs)
+        if not all_glyphs:
+            raise HTTPException(422, "Could not extract any characters. Try a clearer photo with dark ink on white paper.")
 
-        # Style analysis
-        style_analyzer = get_style_analyzer()
-        style_vec = style_analyzer.analyze_multiple(saved_paths)
-        style_dict = style_vec.to_dict()
+        # Clear old glyphs and save new real ones
+        for old in GLYPH_DIR.glob("*.png"):
+            old.unlink()
 
-        # Coverage
-        coverage = extractor.get_coverage_report(_glyph_library)
+        glyph_counts: dict = {}
+        for g in all_glyphs:
+            if not g.char.strip() or g.confidence < 0.4:
+                continue
+            idx = glyph_counts.get(g.char, 0)
+            _save_glyph_image(g.char, g.image, idx)
+            glyph_counts[g.char] = idx + 1
 
-        # Encode style into model
-        model = get_model()
-        model.encode_style(_glyph_library)
+        if not glyph_counts:
+            raise HTTPException(422, "Characters found but could not be labeled. Make sure writing is clear and well-lit.")
+
+        # Save style metrics
+        analyzer = _load_style_analyzer()
+        style_vec = analyzer.analyze_multiple(saved_paths)
+        _style_metrics = style_vec.to_dict()
+        STYLE_FILE.write_text(json.dumps({
+            "slant_angle":         style_vec.slant_angle,
+            "stroke_width_mean":   style_vec.stroke_width_mean,
+            "stroke_width_std":    style_vec.stroke_width_std,
+            "letter_spacing_mean": style_vec.letter_spacing_mean,
+            "baseline_variance":   style_vec.baseline_variance,
+            "pressure_mean":       style_vec.pressure_mean,
+            "pressure_std":        style_vec.pressure_std,
+            "aspect_ratio_mean":   style_vec.aspect_ratio_mean,
+            "loop_density":        style_vec.loop_density,
+        }))
+
+        all_chars = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?'\"")
+        present = [c for c in all_chars if c in glyph_counts]
+        missing = [c for c in all_chars if c not in glyph_counts]
 
         return JSONResponse({
-            "total_images": len(saved_paths),
+            "total_images":           len(saved_paths),
             "total_glyphs_extracted": len(all_glyphs),
-            "characters_found": len(coverage["present"]),
-            "characters_present": coverage["present"],
-            "characters_missing": coverage["missing"],
-            "coverage_pct": coverage["coverage_pct"],
-            "style_metrics": style_dict,
+            "characters_found":       len(present),
+            "characters_present":     present,
+            "characters_missing":     missing,
+            "coverage_pct":           round(len(present) / len(all_chars) * 100, 1),
+            "samples_per_char":       glyph_counts,
+            "style_metrics":          _style_metrics,
         })
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Corpus analysis failed: {e}")
+        logger.error(f"Corpus analysis failed: {e}", exc_info=True)
         raise HTTPException(500, str(e))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -116,125 +145,67 @@ async def analyze_corpus(images: List[UploadFile] = File(...)):
 
 class SynthesizeRequest(BaseModel):
     missing_chars: List[str]
-    style_metrics: Optional[dict] = None
 
 
 @router.post("/synthesize")
 async def synthesize_missing(req: SynthesizeRequest):
-    """Synthesize missing glyphs using font + style transfer."""
-    try:
-        font_synth = get_font_synth()
-        synthesized = font_synth.synthesize_missing(
-            missing_chars=req.missing_chars,
-            existing_glyphs=_glyph_library,
-            style_metrics=req.style_metrics,
-        )
-
-        # Add to global library
-        _glyph_library.update(synthesized)
-
-        # Re-encode style
-        model = get_model()
-        model.encode_style(_glyph_library)
-
-        return {"synthesized": list(synthesized.keys()), "total_library_size": len(_glyph_library)}
-    except Exception as e:
-        logger.error(f"Synthesis failed: {e}")
-        raise HTTPException(500, str(e))
-
-
-@router.post("/match-style")
-async def match_style(images: List[UploadFile] = File(...)):
     """
-    Upload 1–3 handwriting photos → returns the closest preset style ID
-    by comparing extracted style metrics against all preset style vectors.
+    Synthesize missing chars using font + user's extracted style metrics.
+    Saved alongside real glyphs so /render uses them transparently.
     """
-    import json, math
-    tmpdir = tempfile.mkdtemp()
-    try:
-        saved_paths = []
-        for img in images:
-            dest = os.path.join(tmpdir, img.filename or "img.png")
-            with open(dest, "wb") as f:
-                shutil.copyfileobj(img.file, f)
-            saved_paths.append(dest)
+    if not req.missing_chars:
+        return {"synthesized": [], "message": "Nothing to synthesize"}
 
-        # Extract style from uploaded images
-        style_analyzer = get_style_analyzer()
-        style_vec = style_analyzer.analyze_multiple(saved_paths)
+    style = json.loads(STYLE_FILE.read_text()) if STYLE_FILE.exists() else None
 
-        # Load preset library
-        preset_path = Path(__file__).parent.parent / "data" / "preset_styles" / "styles.json"
-        with open(preset_path) as f:
-            presets = json.load(f)
+    font_synth = _load_font_synth()
+    synthesized = font_synth.synthesize_missing(
+        missing_chars=req.missing_chars,
+        existing_glyphs={},
+        style_metrics=style,
+        samples_per_char=2,
+    )
+    for char, imgs in synthesized.items():
+        for i, img in enumerate(imgs):
+            _save_glyph_image(char, img, i)
 
-        # Euclidean distance in style space (normalized)
-        def style_distance(preset):
-            d = 0
-            weights = {
-                "slant_angle": 0.30,
-                "stroke_width_mean": 0.20,
-                "letter_spacing_mean": 0.15,
-                "baseline_variance": 0.10,
-                "pressure_mean": 0.15,
-                "loop_density": 0.10,
-            }
-            ranges = {
-                "slant_angle": 20, "stroke_width_mean": 3,
-                "letter_spacing_mean": 15, "baseline_variance": 8,
-                "pressure_mean": 1, "loop_density": 1,
-            }
-            for key, w in weights.items():
-                user_val = getattr(style_vec, key, 0)
-                preset_val = preset.get(key, 0)
-                r = ranges.get(key, 1)
-                d += w * ((user_val - preset_val) / r) ** 2
-            return math.sqrt(d)
-
-        best_id = min(presets, key=lambda k: style_distance(presets[k]))
-        best = presets[best_id]
-        dist = style_distance(best)
-        confidence = max(40, min(99, int(100 - dist * 120)))
-
-        # Load this preset's style into the model
-        model = get_model()
-        from utils.style_analyzer import StyleVector
-        sv = StyleVector(
-            slant_angle=best["slant_angle"],
-            stroke_width_mean=best["stroke_width_mean"],
-            stroke_width_std=best["stroke_width_std"],
-            letter_spacing_mean=best["letter_spacing_mean"],
-            baseline_variance=best["baseline_variance"],
-            pressure_mean=best["pressure_mean"],
-            pressure_std=best["pressure_std"],
-            aspect_ratio_mean=best["aspect_ratio_mean"],
-            loop_density=best["loop_density"],
-        )
-
-        return JSONResponse({
-            "matched_id": best_id,
-            "label": best["label"],
-            "confidence": confidence,
-            "slant": f"{best['slant_angle']}°",
-            "pressure": sv.to_dict()["pen_pressure"],
-            "spacing": sv.to_dict()["letter_spacing"],
-            "preview": "Hello World",
-        })
-    except Exception as e:
-        logger.error(f"Style matching failed: {e}")
-        raise HTTPException(500, str(e))
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return {
+        "synthesized": list(synthesized.keys()),
+        "total_glyphs_on_disk": len(list(GLYPH_DIR.glob("*.png"))),
+    }
 
 
-@router.post("/train")
-async def train_model(epochs: int = 50):
-    """Fine-tune the synthesis model on the current glyph library."""
-    if not _glyph_library:
-        raise HTTPException(400, "No glyph library loaded. Run /corpus/analyze first.")
-    try:
-        model = get_model()
-        model.train_on_corpus(_glyph_library, epochs=epochs)
-        return {"status": "training_complete", "epochs": epochs}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+@router.get("/status")
+async def corpus_status():
+    chars = _list_saved_chars()
+    return {"ready": len(chars) > 0, "total_chars": len(chars), "chars": chars, "has_style": STYLE_FILE.exists()}
+
+
+class SetPresetRequest(BaseModel):
+    style_id: str
+
+
+@router.post("/set-preset")
+async def set_preset(req: SetPresetRequest):
+    """
+    Load a preset IAM style vector into the active style file
+    so /render uses those metrics for synthesizing missing chars.
+    """
+    preset_path = Path(__file__).parent.parent / "data" / "preset_styles" / "styles.json"
+    if not preset_path.exists():
+        raise HTTPException(404, "Preset styles file not found")
+
+    presets = json.loads(preset_path.read_text())
+    if req.style_id not in presets:
+        raise HTTPException(404, f"Unknown style id: {req.style_id}")
+
+    # Clear any real user glyphs so renderer falls back to font synthesis
+    for old in GLYPH_DIR.glob("*.png"):
+        old.unlink()
+
+    # Write preset metrics as the active style
+    preset = presets[req.style_id]
+    STYLE_FILE.write_text(json.dumps({k: v for k, v in preset.items()
+                                      if k not in ("label", "iam_writer_id")}))
+
+    return {"ok": True, "style_id": req.style_id, "label": preset["label"]}
