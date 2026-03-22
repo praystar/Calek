@@ -161,17 +161,20 @@ class CharacterExtractor:
         return words if words else [line]
 
     def _segment_characters(self, word: np.ndarray) -> List[Tuple[np.ndarray, Tuple]]:
-        """Connected component analysis for character bounding boxes."""
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(word, connectivity=8)
+        """Segment characters, merging nearby strokes before splitting."""
+        # Dilate horizontally to merge disconnected strokes (e, H, i dots etc.)
+        merged = self._merge_nearby_components(word, gap=6)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
         chars = []
 
-        # Sort by x position (left to right)
         components = sorted(
             [(stats[i], i) for i in range(1, num_labels)],
             key=lambda x: x[0][cv2.CC_STAT_LEFT]
         )
 
         word_h = word.shape[0]
+        word_w = word.shape[1]
         for stat, label_id in components:
             x = stat[cv2.CC_STAT_LEFT]
             y = stat[cv2.CC_STAT_TOP]
@@ -179,10 +182,15 @@ class CharacterExtractor:
             h = stat[cv2.CC_STAT_HEIGHT]
             area = stat[cv2.CC_STAT_AREA]
 
-            # Filter noise: character must be reasonably sized
             if area < 30 or h < word_h * 0.2 or w < 3:
                 continue
+            if w > word_w * 0.65 or h > word_h * 1.2:
+                continue
+            aspect = w / max(h, 1)
+            if aspect > 5.0 or aspect < 0.08:
+                continue
 
+            # Crop from ORIGINAL word (not dilated) for clean glyph pixels
             char_img = word[y:y+h, x:x+w]
             chars.append((char_img, (x, y, w, h)))
 
@@ -232,14 +240,21 @@ class CharacterExtractor:
             return ""
 
     def _normalize_glyph(self, glyph: np.ndarray) -> np.ndarray:
-        """Normalize glyph to fixed size with padding."""
-        # Add border padding
-        padded = cv2.copyMakeBorder(glyph, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0)
-        # Resize to fixed size
+        """Normalize glyph to fixed size. ink=1.0 (bright), paper=0.0 (dark)."""
+        padded  = cv2.copyMakeBorder(glyph, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0)
         resized = cv2.resize(padded, (self.glyph_size, self.glyph_size), interpolation=cv2.INTER_AREA)
-        # Normalize to [0, 1]
-        normalized = resized.astype(np.float32) / 255.0
-        return normalized
+        norm    = resized.astype(np.float32) / 255.0
+        # Use border pixels to detect inversion — border is pure padding (value=0=paper).
+        # If border is bright, image is inverted.
+        border = np.concatenate([norm[0,:], norm[-1,:], norm[:,0], norm[:,-1]])
+        if np.mean(border) > 0.15:
+            norm = 1.0 - norm
+        return np.clip(norm, 0.0, 1.0)
+
+    def _merge_nearby_components(self, word: np.ndarray, gap: int = 6) -> np.ndarray:
+        """Dilate horizontally to merge disconnected strokes of the same letter."""
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (gap, 1))
+        return cv2.dilate(word, kernel, iterations=1)
 
     def build_glyph_library(self, glyphs: List[Glyph]) -> Dict[str, List[np.ndarray]]:
         """

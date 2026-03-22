@@ -22,6 +22,7 @@ load_dotenv()
 from routes.corpus import router as corpus_router
 from routes.render import router as render_router
 from routes.transcribe import router as transcribe_router
+from routes.chat import router as chat_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,9 +44,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(corpus_router, prefix="/corpus", tags=["Corpus"])
-app.include_router(render_router, prefix="/render", tags=["Render"])
-app.include_router(transcribe_router, prefix="/transcribe", tags=["Transcribe"])
+app.include_router(corpus_router,    prefix="/corpus",    tags=["Corpus"])
+app.include_router(render_router,    prefix="/render",     tags=["Render"])
+app.include_router(transcribe_router,prefix="/transcribe", tags=["Transcribe"])
+app.include_router(chat_router,      prefix="/chat",       tags=["Chat"])
 
 
 @app.get("/")

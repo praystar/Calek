@@ -2,8 +2,10 @@ import { useState, useRef, useEffect } from "react";
 import { Send, Bot, PenTool, Trash2, Download, Key } from "lucide-react";
 import toast from "react-hot-toast";
 import HandwritingCanvas from "../components/HandwritingCanvas";
+import api from "../utils/api"
 
-const GEMINI_MODEL = "gemini-2.0-flash";
+const COOLDOWN_MS    = 5500;   // mirrors backend MIN_INTERVAL + buffer
+const MAX_HISTORY    = 6;
 
 export default function ChatPage() {
   const [messages, setMessages] = useState([]);
@@ -14,8 +16,11 @@ export default function ChatPage() {
   const [selectedAnswer, setSelectedAnswer] = useState(null);
   const [renderHW, setRenderHW] = useState(false);
 
-  const chatEndRef = useRef(null);
-  const inputRef = useRef(null);
+  const chatEndRef    = useRef(null);
+  const inputRef      = useRef(null);
+  const inFlightRef   = useRef(false);
+  const lastSentRef   = useRef(0);          // timestamp of last successful send
+  const [cooldown, setCooldown] = useState(0); // seconds remaining
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
@@ -26,46 +31,56 @@ export default function ChatPage() {
     toast.success("Gemini API key saved");
   };
 
-  const sendMessage = async () => {
-    if (!input.trim() || loading) return;
-    if (!apiKey) { setShowKeyInput(true); toast.error("Set your Gemini API key first"); return; }
+  // Cooldown ticker
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown(c => Math.max(0, c - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
 
-    const userMsg = { role: "user", content: input.trim(), id: Date.now() };
+  const sendMessage = async () => {
+    if (!input.trim() || loading || inFlightRef.current) return;
+
+    // Client-side cooldown (backup — backend enforces its own)
+    const now     = Date.now();
+    const elapsed = now - lastSentRef.current;
+    if (elapsed < COOLDOWN_MS) {
+      const wait = Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+      toast.error(`Wait ${wait}s before sending again`);
+      return;
+    }
+
+    inFlightRef.current  = true;
+    lastSentRef.current  = now;          // update on EVERY attempt, not just success
+    setCooldown(Math.ceil(COOLDOWN_MS / 1000));
+
+    const userMsg = { role: "user", content: input.trim(), id: now };
     setMessages(prev => [...prev, userMsg]);
     setInput("");
     setLoading(true);
 
     try {
-      // Build conversation history for Gemini
-      const history = messages.map(m => ({
-        role: m.role === "user" ? "user" : "model",
-        parts: [{ text: m.content }]
+      const recentHistory = messages.slice(-MAX_HISTORY).map(m => ({
+        role: m.role, content: m.content,
       }));
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [...history, { role: "user", parts: [{ text: userMsg.content }] }],
-          generationConfig: { temperature: 0.9, maxOutputTokens: 1024 }
-        })
+      // Call backend proxy — backend enforces rate limit server-side
+      const resp = await api.post("/chat", {
+        message:  userMsg.content,
+        history:  recentHistory,
+        api_key:  apiKey,   // backend .env key takes priority; this is fallback
       });
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error?.message || "Gemini API error");
-      }
+      setMessages(prev => [...prev, { role: "assistant", content: resp.data.reply, id: Date.now() + 1 }]);
 
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
-
-      const assistantMsg = { role: "assistant", content: text, id: Date.now() + 1 };
-      setMessages(prev => [...prev, assistantMsg]);
     } catch (err) {
-      toast.error(err.message);
-      setMessages(prev => [...prev, { role: "assistant", content: `Error: ${err.message}`, id: Date.now() + 1, isError: true }]);
+      const msg = err.response?.data?.detail || err.message || "Something went wrong";
+      toast.error(msg);
+      setMessages(prev => [...prev, { role: "assistant", content: `⚠ ${msg}`, id: Date.now() + 1, isError: true }]);
+    } finally {
+      setLoading(false);
+      inFlightRef.current = false;
     }
-    setLoading(false);
   };
 
   const renderInHandwriting = (msg) => {
@@ -174,13 +189,19 @@ export default function ChatPage() {
                 ref={inputRef}
                 value={input}
                 onChange={e => setInput(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
-                placeholder="Ask Gemini anything…"
-                disabled={loading}
+                onKeyDown={e => e.key === "Enter" && !e.shiftKey && !cooldown && sendMessage()}
+                placeholder={cooldown > 0 ? `Wait ${cooldown}s before sending…` : "Ask Gemini anything…"}
+                disabled={loading || cooldown > 0}
                 style={{ flex: 1 }}
               />
-              <button className="btn btn-primary btn-icon" onClick={sendMessage} disabled={loading || !input.trim()}>
-                <Send size={16} />
+              <button
+                className="btn btn-primary btn-icon"
+                onClick={sendMessage}
+                disabled={loading || !input.trim() || cooldown > 0}
+                title={cooldown > 0 ? `Wait ${cooldown}s` : "Send"}
+                style={{ minWidth: 44, fontSize: cooldown > 0 ? 12 : undefined }}
+              >
+                {cooldown > 0 ? `${cooldown}s` : <Send size={16} />}
               </button>
             </div>
           </div>

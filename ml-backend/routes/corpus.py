@@ -38,10 +38,11 @@ def _load_font_synth():
 
 
 def _save_glyph_image(char: str, img_array: np.ndarray, index: int) -> Path:
-    safe = ord(char)
+    safe = ord(char) if len(char) == 1 else abs(hash(char)) % 0xFFFF
     path = GLYPH_DIR / f"{safe}_{index}.png"
-    pil = Image.fromarray((img_array * 255).astype(np.uint8))
-    pil.save(path)
+    arr  = (np.clip(img_array, 0.0, 1.0) * 255).astype(np.uint8)
+    Image.fromarray(arr, mode="L").save(path)
+    return path
     return path
 
 
@@ -50,7 +51,11 @@ def _list_saved_chars() -> List[str]:
     for f in GLYPH_DIR.glob("*.png"):
         try:
             codepoint = int(f.stem.split("_")[0])
-            chars.add(chr(codepoint))
+            if codepoint > 0xFFFF:
+                continue  # skip hash-named placeholder files
+            char = chr(codepoint)
+            if not char.startswith("~"):
+                chars.add(char)
         except Exception:
             pass
     return sorted(chars)
@@ -93,15 +98,26 @@ async def analyze_corpus(images: List[UploadFile] = File(...)):
             old.unlink()
 
         glyph_counts: dict = {}
+        unlabeled_count = 0
         for g in all_glyphs:
-            if not g.char.strip() or g.confidence < 0.4:
-                continue
-            idx = glyph_counts.get(g.char, 0)
-            _save_glyph_image(g.char, g.image, idx)
-            glyph_counts[g.char] = idx + 1
+            # Save regardless of OCR — image is valid for style even if label failed
+            if not g.char.strip() or g.confidence < 0.1:
+                placeholder = f"~{unlabeled_count}"
+                unlabeled_count += 1
+                idx = glyph_counts.get(placeholder, 0)
+                _save_glyph_image(placeholder, g.image, idx)
+                glyph_counts[placeholder] = idx + 1
+            else:
+                idx = glyph_counts.get(g.char, 0)
+                _save_glyph_image(g.char, g.image, idx)
+                glyph_counts[g.char] = idx + 1
 
+        labeled = {k: v for k, v in glyph_counts.items() if not k.startswith("~")}
         if not glyph_counts:
-            raise HTTPException(422, "Characters found but could not be labeled. Make sure writing is clear and well-lit.")
+            raise HTTPException(422, "Could not extract any glyphs. Try a clearer photo with dark ink on white paper.")
+        if not labeled:
+            logger.warning("OCR labeling failed — install easyocr. Style metrics still extracted.")
+        glyph_counts = labeled if labeled else glyph_counts
 
         # Save style metrics
         analyzer = _load_style_analyzer()
